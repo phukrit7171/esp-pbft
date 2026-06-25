@@ -1,0 +1,14 @@
+version: "0.0.1"
+description: PBFT — memory-optimised PBFT consensus for ESP-IDF
+url: https://github.com/phukrit7171/esp-pbft
+license: "MIT"
+targets:
+  - esp32
+  - esp32s2
+  - esp32s3
+  - esp32c3
+  - esp32c6
+  - esp32c61
+  - esp32h2
+dependencies:
+  idf: ">=6.0.1"
