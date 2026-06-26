@@ -23,9 +23,10 @@ Build a **memory-optimized PBFT (Practical Byzantine Fault Tolerance) consensus 
 
 1. **Minimal core** — no app-specific logic, no blockchain, no VM, no account model
 2. **Generic API** — `submit(tx) → callback(tx, sequence)` so any app can plug in
-3. **ESP32-C3 optimised** — minimal RAM footprint, no PSRAM, ESP-NOW transport
+3. **ESP32-C3 optimised** — minimal RAM footprint, no PSRAM, transport configurable at compile time (ESP-NOW default, Wi-Fi UDP optional)
 4. **Reusable** — extension hooks for blockchain / state-machine layer later
-5. **Modern ESP-IDF** — PSA Crypto API (Mbed TLS 4.0), not deprecated `mbedtls_*`
+5. **Transport-agnostic** — same PBFT wire format works on ESP-NOW or Wi-Fi UDP multicast; swap via Kconfig
+6. **Modern ESP-IDF** — PSA Crypto API (Mbed TLS 4.0), not deprecated `mbedtls_*`
 
 ### 1.3 What is NOT in scope
 
@@ -46,8 +47,10 @@ Build a **memory-optimized PBFT (Practical Byzantine Fault Tolerance) consensus 
 - **n = 7 nodes** (one is primary, six are replicas)
 - **f = 2** (tolerates 2 Byzantine nodes)
 - **Quorum** = `2f+1 = 5` for Prepare and Commit
-- **Transport:** ESP-NOW broadcast (peer-to-peer, no AP/router)
-- **Range:** ~200 m, ~80 mA active
+- **Transport:** **configurable at compile time** via Kconfig
+  - `CONFIG_PBFT_TRANSPORT_ESP_NOW=y` (default): peer-to-peer, no AP, ~80 mA
+  - `CONFIG_PBFT_TRANSPORT_WIFI_UDP=y`: AP-based, IGMP multicast, ~160 mA
+  - See [PROTOCOL.md](./PROTOCOL.md) for transport abstraction details
 
 ### 2.2 Module layering
 
@@ -113,18 +116,31 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) §3 for full state-machine spec and [CO
 n = 3f + 1
   f=1 → n=4   (1/4 = 25% faulty tolerance) — too small for real Byzantine stress
   f=2 → n=7   (2/7 = 29% faulty tolerance) ← CHOSEN — well-studied config
-  f=3 → n=10  — exceeds ESP-NOW comfortable broadcast count
+  f=3 → n=10  — exceeds comfortable broadcast count (ESP-NOW officially ≤20 peers)
 ```
 
-### 3.3 Why ESP-NOW?
+### 3.3 Transport selection (compile-time)
 
-| Transport | Range | Power | Throughput | Complexity |
-|-----------|-------|-------|------------|------------|
-| **ESP-NOW** | 200 m | Low (~80 mA) | 1 Mbps | Low |
-| Wi-Fi UDP  | 200 m | High (~160 mA) | 54 Mbps | High |
-| BLE        | 100 m | Very Low (~15 mA) | 2 Mbps | Medium |
+| Transport | Range | Power | Throughput | Cluster size | AP needed | Multicast |
+|-----------|-------|-------|------------|--------------|-----------|-----------|
+| **ESP-NOW** (default) | 200 m | Low (~80 mA) | 1 Mbps | ≤10 (officially ≤20) | ❌ | Broadcast to FF:FF:FF:FF:FF:FF |
+| **Wi-Fi UDP** | 200 m | High (~160 mA) | 54 Mbps | unlimited | ✅ | IGMP group join |
 
-**Chosen because:** 2× lower power than Wi-Fi, no AP/router needed, ~10–20 ms latency, built-in CCMP encryption. See [POWER.md](./POWER.md) for full measurements.
+**Default = ESP-NOW** (`CONFIG_PBFT_TRANSPORT_ESP_NOW=y`) because:
+- ✅ 2× lower power than Wi-Fi (battery life)
+- ✅ No AP/router needed (simpler deployment)
+- ✅ ~10–20 ms latency (good enough for PBFT)
+- ✅ Built-in CCMP encryption
+- ✅ Sufficient for n=7 cluster
+
+**Select Wi-Fi UDP** (`CONFIG_PBFT_TRANSPORT_WIFI_UDP=y`) when:
+- Larger cluster (>10 nodes) needed
+- AP infrastructure already exists
+- Higher throughput required (>1 Mbps)
+
+**Constraint:** Both transports use the same PBFT wire format (see [PROTOCOL.md](./PROTOCOL.md)). Switching transport does NOT require changing application code.
+
+See [POWER.md](./POWER.md) for ESP-NOW measurements and [FAILURE-MODES.md](./FAILURE-MODES.md) for transport-specific failure modes (e.g., IGMP group leave, broadcast storm).
 
 ### 3.4 Why PSA Crypto?
 
@@ -211,14 +227,20 @@ esp-pbft is the consensus layer; the blockchain layer (if needed later) can be a
 | Crypto contexts (PSA) | ~7–12 KB | ECDH + ECDSA gen + HMAC + PSA core |
 | HMAC keys (derived) | 192 B | 6 peers × 32 B (RAM only, regenerated each boot) |
 | ECDSA private key (boot) | ~700 B | RAM only, regenerated each boot |
-| Network buffers | ~8 KB | 2 × 4 KB TX/RX |
+| Network buffers | ~8 KB | 2 × 4 KB TX/RX (same for both transports) |
+| Transport stack (ESP-NOW) | ~15 KB | esp_now component + Wi-Fi driver (lightweight) |
+| Transport stack (Wi-Fi UDP) | ~45 KB | esp_wifi + lwIP + IGMP + sockets (heavier) |
 | Persistent state | ~1 KB | view, sequence, last checkpoint |
-| **Total used** | **~25 KB** | **~6% of 400 KB** |
-| **Free** | **~375 KB** | 94% |
+| **Total used (ESP-NOW build)** | **~40 KB** | **~10% of 400 KB** |
+| **Total used (Wi-Fi UDP build)** | **~70 KB** | **~17.5% of 400 KB** |
+| **Free (ESP-NOW)** | **~360 KB** | 90% |
+| **Free (Wi-Fi UDP)** | **~330 KB** | 82.5% |
 
 See [MEMORY.md](./MEMORY.md) for detailed layout.
 
-### 3.8 Power budget
+### 3.8 Power budget (per transport)
+
+**ESP-NOW build (default):**
 
 | Mode | Current | Time/Day | Energy/Day |
 |------|---------|----------|------------|
@@ -226,9 +248,19 @@ See [MEMORY.md](./MEMORY.md) for detailed layout.
 | Light sleep | 0.5 mA | 23 h | 11.5 mAh |
 | **Total** | — | — | **~92 mAh/day** |
 
-With a 1000 mAh battery → **~10 days battery life**.
+→ 1000 mAh battery → **~10 days battery life**
 
-See [POWER.md](./POWER.md) for state-transition design.
+**Wi-Fi UDP build:**
+
+| Mode | Current | Time/Day | Energy/Day |
+|------|---------|----------|------------|
+| Active (consensus) | 160 mA | 1 h | 160 mAh |
+| Light sleep | 0.5 mA | 23 h | 11.5 mAh |
+| **Total** | — | — | **~172 mAh/day** |
+
+→ 1000 mAh battery → **~5.8 days battery life**
+
+See [POWER.md](./POWER.md) for state-transition design and per-mode measurements.
 
 ---
 
@@ -241,7 +273,9 @@ esp-pbft/
 │   ├── pbft_types.h            ← shared types, enums, structs
 │   ├── pbft_config.h           ← configuration constants
 │   ├── pbft_crypto.h           ← crypto API
-│   ├── pbft_network.h          ← ESP-NOW transport API
+│   ├── pbft_network.h          ← transport abstraction interface
+│   ├── pbft_network_espnow.c   ← ESP-NOW impl (CONFIG_PBFT_TRANSPORT_ESP_NOW)
+│   ├── pbft_network_wifi_udp.c ← Wi-Fi UDP multicast impl (CONFIG_PBFT_TRANSPORT_WIFI_UDP)
 │   ├── pbft_membership.h       ← 7-node membership
 │   ├── pbft_consensus.h        ← 3-phase consensus
 │   ├── pbft_viewchange.h       ← view-change protocol
@@ -251,7 +285,7 @@ esp-pbft/
 ├── src/
 │   ├── pbft.c                  ← public API impl
 │   ├── pbft_crypto.c           ← HMAC + ECDSA + ECDH + HKDF (PSA)
-│   ├── pbft_network.c          ← ESP-NOW
+│   ├── pbft_network.c          ← transport abstraction (selects ESP-NOW or Wi-Fi UDP at compile time)
 │   ├── pbft_membership.c       ← 7-node table
 │   ├── pbft_consensus.c        ← 3 phases
 │   ├── pbft_viewchange.c       ← primary rotation
@@ -380,6 +414,7 @@ This folder contains:
 | **HMAC** | Hash-based Message Authentication Code (RFC 2104) |
 | **HKDF** | HMAC-based Key Derivation Function (RFC 5869) |
 | **PSA Crypto** | Platform Security Architecture Crypto API (Arm standard) |
+| **Kconfig** | ESP-IDF compile-time configuration system (`CONFIG_PBFT_TRANSPORT_ESP_NOW` / `..._WIFI_UDP`) |
 | **ESP-NOW** | Espressif connectionless Wi-Fi protocol |
 | **NVS** | Non-Volatile Storage (ESP-IDF key-value store) |
 
