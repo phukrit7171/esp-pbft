@@ -472,4 +472,129 @@ These are higher-level than the HANDOVER.md open questions:
 
 ---
 
-**End of ARCHITECTURE.md (v0.1 draft — awaiting review)**
+## 11. Static memory discipline
+
+**Principle:** esp-pbft uses **only static allocation** for all internal state. No `malloc`, `calloc`, `realloc`, or `free` calls in the hot path. All buffers, contexts, and data structures are compile-time-sized and live in BSS.
+
+### 11.1 Why static only
+
+| Benefit | Impact |
+|---------|--------|
+| **Deterministic boot** | Memory available at start = always same |
+| **No heap fragmentation** | Long-running cluster (months) won't degrade |
+| **Predictable budget** | Compile-time check that total ≤ 400 KB SRAM |
+| **No ENOMEM at runtime** | Hot path never blocked by allocation failure |
+| **Easier safety review** | All memory visible at compile time |
+| **Better for OTA** | Memory layout stable across versions |
+
+### 11.2 Static allocation inventory
+
+| Data structure | Size | Where | Lifetime |
+|----------------|------|-------|----------|
+| `pbft_config_t` (active config) | ~100 B | BSS | Permanent |
+| ECDSA private key (current boot) | 32 B | BSS | RAM, regenerated on Y-5 |
+| ECDSA public key (own) | 64 B | BSS | RAM, regenerated on Y-5 |
+| Peer pubkey cache (7 nodes) | 7 × 64 B = 448 B | BSS | Permanent (TOFU) |
+| HMAC keys (6 peers × 32 B) | 192 B | BSS | RAM, regenerated on Y-5 |
+| Pending TX log (100 entries × ~120 B) | ~12 KB | BSS | Until checkpoint GC |
+| Prepare certificate cache (per-view) | ~2 KB | BSS | Per-view |
+| Commit certificate cache (per-view) | ~2 KB | BSS | Per-view |
+| View-change state | ~1 KB | BSS | Per-view |
+| Checkpoint state | ~500 B | BSS | Permanent |
+| Network TX buffer | 4 KB | BSS | Permanent |
+| Network RX buffer | 4 KB | BSS | Permanent |
+| PSA crypto contexts (ECDSA, ECDH, HMAC) | ~3 KB | BSS | Permanent |
+| Metrics counters | ~200 B | BSS | Permanent |
+| **Total static** | **~30 KB** | **BSS** | — |
+
+### 11.3 Compile-time bounds checking
+
+Use `static_assert()` (C11) or `BUILD_BUG_ON()` to enforce:
+
+```c
+// Compile-time checks (verified by idf.py build)
+_Static_assert(sizeof(pbft_node_state_t) <= PBFT_NODE_STATE_MAX_BYTES,
+               "pbft_node_state_t exceeded budget");
+
+_Static_assert(PBFT_LOG_MAX_ENTRIES == 100,
+               "PBFT_LOG_MAX_ENTRIES must be 100 for memory budget");
+
+_Static_assert(PBFT_CLUSTER_SIZE == 7,
+               "PBFT_CLUSTER_SIZE must be 7 (n=7, f=2)");
+```
+
+If any check fails, **build fails** (not runtime crash).
+
+### 11.4 Stack allocation (still allowed)
+
+Function-local variables are fine — they live on the stack and are bounded by `CONFIG_ESP_MAIN_TASK_STACK_SIZE` or per-task stack size:
+
+```c
+esp_err_t pbft_verify_hmac(const uint8_t* key, const uint8_t* data, size_t len) {
+    uint8_t calc_mac[32];                  // OK: 32 B on stack
+    psa_mac_compute(..., calc_mac, ...);
+    return memcmp(calc_mac, ..., 32) == 0 ? ESP_OK : ESP_FAIL;
+    // No malloc, no static state, safe to call concurrently within the same task
+}
+```
+
+### 11.5 What is NOT static (acceptable exceptions)
+
+| Item | Why dynamic is OK |
+|------|-------------------|
+| **NVS blob read/write** | ESP-IDF NVS internally allocates; we just call `nvs_get_blob` (caller-supplied buffer is static) |
+| **ESP-NOW peer registration** | ESP-IDF manages internally; we call `esp_now_add_peer` once at boot |
+| **Wi-Fi driver internal buffers** | Managed by ESP-IDF component, not esp-pbft code |
+| **PSA crypto internal scratch** | Managed by mbedtls core; sized via `MBEDTLS_PSA_{KEY,ALGO}_BITS` macros (compile-time) |
+| **mbedtls SSL contexts** | Only used during TLS handshake (not in our pattern; handshake uses PSA key agreement directly) |
+
+These are **library-internal allocations** outside our control. We never call `malloc`/`free` directly in esp-pbft.
+
+### 11.6 Consequences for design
+
+| Design choice | Why static requires it |
+|---------------|------------------------|
+| **Fixed cluster size** | `PBFT_CLUSTER_SIZE = 7` at compile time |
+| **Fixed log size** | `PBFT_LOG_MAX_ENTRIES = 100` at compile time |
+| **No dynamic node join** | Cannot allocate peer slot at runtime; new node must be in cluster config (compile-time) |
+| **Fixed payload size** | TX payload ≤ 256 B (compile-time max) |
+| **No string interning** | All messages use fixed-size byte buffers, not heap-allocated strings |
+
+### 11.7 Compile-time configuration (Kconfig)
+
+```kconfig
+# sdkconfig.defaults additions
+CONFIG_PBFT_LOG_MAX_ENTRIES=100
+CONFIG_PBFT_CLUSTER_SIZE=7
+CONFIG_PBFT_TX_PAYLOAD_MAX=256
+CONFIG_PBFT_TRANSPORT_ESP_NOW=y
+# CONFIG_PBFT_TRANSPORT_WIFI_UDP is not set
+```
+
+Each option drives a `static_assert` in `pbft_config.h`.
+
+### 11.8 Memory audit checklist (before merge)
+
+Every PR must confirm:
+
+- [ ] No `malloc`/`calloc`/`realloc`/`free` in new code (grep verification)
+- [ ] No FreeRTOS `xQueueCreate`/`xTaskCreate` with dynamic sizes
+- [ ] All new buffers are `static` or BSS
+- [ ] `static_assert` added for any new compile-time bounds
+- [ ] Total static usage updated in `HANDOVER.md` §3.7 table
+- [ ] `idf.py size-components` shows no unexpected growth
+
+### 11.9 Trade-offs accepted
+
+| Trade-off | Mitigation |
+|-----------|------------|
+| Cannot add node at runtime | Provisioning via NVS at factory; Y-5 re-handshake allows refresh |
+| Large payload requires recompile | TX_PAYLOAD_MAX = 256 covers typical IoT use cases |
+| Wasted RAM if cluster smaller than 7 | Acceptable — 192 B HMAC keys, ~500 B peer cache total |
+| Cannot grow log beyond 100 entries | Checkpoint GC runs every K=100 sequences, keeps bounded |
+
+See [MEMORY.md](./MEMORY.md) (when written) for detailed per-module memory layout.
+
+---
+
+**End of ARCHITECTURE.md (v0.2 draft — static memory discipline added)**
