@@ -135,27 +135,54 @@ ESP-IDF v6.0.1 ships **Mbed TLS 4.0.0 + TF-PSA-Crypto**. Legacy `mbedtls_*` APIs
 - ✅ Side-channel resistant
 - ✅ Built-in key ID lifecycle (`mbedtls_svc_key_id_t`)
 
-**Verified API surface** (from `~/.espressif/v6.0.1/esp-idf/components/mbedtls/.../psa/crypto.h`):
-- `psa_generate_key`, `psa_sign_message`, `psa_verify_message`
-- `psa_mac_compute`, `psa_mac_verify`
-- `psa_key_derivation_setup / input_bytes / input_key / output_bytes`
+**PSA APIs used in esp-pbft** (verified from `~/.espressif/v6.0.1/esp-idf/components/mbedtls/.../psa/crypto.h`):
+- `psa_generate_key` — TRNG-backed ECDSA P-256 keypair at boot
+- `psa_key_agreement` (`PSA_ALG_ECDH`) — derive shared secret with each peer
+- `psa_mac_compute` / `psa_mac_verify` — HMAC-SHA256 per message (SHA HW-accelerated)
+
+**APIs explicitly NOT used** (kept out of runtime hot path):
+- `psa_sign_message` / `psa_verify_message` — no ECDSA at runtime (~50 ms cost; would kill throughput)
 
 Full design in [CRYPTO.md](./CRYPTO.md).
 
-### 3.5 Authentication pattern — **Pattern C** (Hybrid)
+### 3.5 Authentication pattern — **Pattern Y** (TRNG + ECDH-boot + HMAC-runtime)
 
-> **Decision (confirmed 2026-06-26):** Pattern C is the best fit for esp-pbft.
-> See [CRYPTO.md](./CRYPTO.md) §1 for the full comparison.
+> **Decision (confirmed 2026-06-26):** Pattern Y is the final choice.
+> See [CRYPTO.md](./CRYPTO.md) for handshake sequence + key derivation details.
 
 | Pattern | Per-msg cost | Cluster cost / request | Verdict |
 |---------|-------------|----------------------|---------|
-| A — ECDH→HKDF→HMAC | 5 µs | ~70 µs | ✅ Works |
+| A — Pre-shared keys + HMAC | 5 µs | ~70 µs | ❌ Requires keygen.py + per-node flash |
 | B — ECDSA every msg | 50 ms (sign) | ~750 ms | ❌ Slow on ESP32-C3 |
-| **C — ECDSA identity + HMAC per-msg** | **5 µs** | **~70 µs** | ✅✅ **CHOSEN** |
+| C — ECDSA identity + ECDH session + HMAC | 5 µs | ~70 µs | ❌ Over-engineered (no rotation benefit) |
+| **Y — Self-gen TRNG + ECDH-boot + HMAC-runtime** | **5 µs** | **~70 µs** | ✅✅ **CHOSEN** |
 
-**Why Pattern C:** ESP32-C3 has SHA-256 HW + ECC point-mul HW but **no ECDSA-sign HW** (DS peripheral is RSA-only). Per-message ECDSA sign would cost ~50 ms — kills WiFi throughput.
+**Why Pattern Y:**
 
-Pattern C = ECDSA identity (rare) + ECDH→HKDF session (handshake) + HMAC-SHA256 per-message.
+1. **No ECDSA at runtime** — ESP32-C3 has SHA-256 HW + ECC point-mul HW but **no ECDSA-sign HW** (DS peripheral is RSA-only). Per-message ECDSA sign would cost ~50 ms.
+2. **Self-generated keys** — ESP32-C3's hardware TRNG (NIST SP 800-22 compliant) generates ECDSA P-256 keypair at boot. No `keygen.py`, no per-node firmware build, no key flash.
+3. **No key persistence** — Private key lives only in RAM; regenerated on every boot. Forward secrecy is **implicit** (restart = new key = new HMAC keys).
+4. **Pairwise HMAC keys** — Each node derives 6 pairwise HMAC keys (one per peer) via ECDH at boot. ~192 B RAM total.
+5. **Soft re-handshake** — When a peer restarts (new keypair), it broadcasts a Hello; existing peers cache the new pubkey and re-ECDH on demand. No full cluster restart needed.
+6. **TOFU for Hello phase** — Trust-on-first-use: a peer's first Hello is trusted; subsequent Hellos must match the cached pubkey (else alarm). Sufficient for physically-secured IoT cluster.
+
+**Pattern Y summary:**
+```
+Boot:
+  psa_generate_key()                          // ~5 ms (TRNG + ECC HW)
+  → broadcast Hello (pubkey, node_id)
+  → receive Hello from 6 peers
+  → for each peer: ECDH(my_priv, peer_pub) → HMAC-SHA256(shared, "PBFT-HMAC-v1")
+  → store 6 HMAC keys in RAM (192 B)
+
+Runtime:
+  → HMAC-SHA256(hmac_key_peer, view||seq||type||payload) per message
+  → ~5 µs/msg (SHA HW)
+
+Peer restart:
+  → restarted node broadcasts new Hello
+  → peers re-ECDH on demand (soft re-handshake)
+```
 
 ### 3.6 Why no blockchain?
 
@@ -175,7 +202,9 @@ PBFT Core is the consensus layer; the blockchain layer (if needed later) can be 
 |-----------|------|-------|
 | PBFT log (pending TX) | ~6 KB | 100 entries × 60 B |
 | Membership config | ~1 KB | 7 nodes × 140 B |
-| Crypto contexts (PSA) | ~7–12 KB | ECDH + ECDSA + HMAC + PSA core |
+| Crypto contexts (PSA) | ~7–12 KB | ECDH + ECDSA gen + HMAC + PSA core |
+| HMAC keys (derived) | 192 B | 6 peers × 32 B (RAM only, regenerated each boot) |
+| ECDSA private key (boot) | ~700 B | RAM only, regenerated each boot |
 | Network buffers | ~8 KB | 2 × 4 KB TX/RX |
 | Persistent state | ~1 KB | view, sequence, last checkpoint |
 | **Total used** | **~25 KB** | **~6% of 400 KB** |
@@ -368,10 +397,11 @@ This folder contains:
 | 2 | Log size limit | 🟡 Open | Fixed 100 + checkpoint cleanup |
 | 3 | Timeout values | 🟡 Open | Adaptive — start 1000 ms, +25% per round |
 | 4 | Byzantine detection | 🟡 Open | Passive logging v1, active v2 |
-| 5 | Key exchange | ✅ **Decided** | Pre-shared identity keys + ECDH session keys (Pattern C) |
+| 5 | Key exchange | ✅ **Decided** | Self-gen ECDSA P-256 via TRNG at boot, no persistence, ECDH → pairwise HMAC keys |
 | 6 | Concurrency model | 🟡 Open | Single-threaded + FreeRTOS event loop |
 | 7 | Network buffering | 🟡 Open | Static 2×4 KB (predictable) |
-| 8 | State persistence | 🟡 Open | NVS for config + view/seq |
+| 8 | State persistence | 🟡 Open | NVS for config + view/seq (private key NOT persisted — Pattern Y) |
+| ~~9~~ | ~~Key rotation strategy~~ | ✅ **Resolved** | Not needed — restart = rotation (Pattern Y) |
 
 ---
 
