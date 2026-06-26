@@ -154,16 +154,16 @@ Full design in [CRYPTO.md](./CRYPTO.md).
 |---------|-------------|----------------------|---------|
 | A — Pre-shared keys + HMAC | 5 µs | ~70 µs | ❌ Requires keygen.py + per-node flash |
 | B — ECDSA every msg | 50 ms (sign) | ~750 ms | ❌ Slow on ESP32-C3 |
-| C — ECDSA identity + ECDH session + HMAC | 5 µs | ~70 µs | ❌ Over-engineered (no rotation benefit) |
+| C — ECDSA identity + ECDH session + HMAC | 5 µs | ~70 µs | ❌ Over-engineered vs Y |
 | **Y — Self-gen TRNG + ECDH-boot + HMAC-runtime** | **5 µs** | **~70 µs** | ✅✅ **CHOSEN** |
 
-**Why Pattern Y:**
+**Why Pattern Y** (vs alternatives):
 
 1. **No ECDSA at runtime** — ESP32-C3 has SHA-256 HW + ECC point-mul HW but **no ECDSA-sign HW** (DS peripheral is RSA-only). Per-message ECDSA sign would cost ~50 ms.
 2. **Self-generated keys** — ESP32-C3's hardware TRNG (NIST SP 800-22 compliant) generates ECDSA P-256 keypair at boot. No `keygen.py`, no per-node firmware build, no key flash.
-3. **No key persistence** — Private key lives only in RAM; regenerated on every boot. Forward secrecy is **implicit** (restart = new key = new HMAC keys).
+3. **No key persistence** — Private key lives only in RAM; regenerated on every boot.
 4. **Pairwise HMAC keys** — Each node derives 6 pairwise HMAC keys (one per peer) via ECDH at boot. ~192 B RAM total.
-5. **Soft re-handshake** — When a peer restarts (new keypair), it broadcasts a Hello; existing peers cache the new pubkey and re-ECDH on demand. No full cluster restart needed.
+5. **Periodic re-gen (Y-5)** — Every 24 hours (staggered by `node_id × 1h`) each node regenerates its ECDSA keypair in RAM and broadcasts a Hello to trigger **soft re-handshake** among peers. Compromise window is bounded by the re-gen period, not by node uptime.
 6. **TOFU for Hello phase** — Trust-on-first-use: a peer's first Hello is trusted; subsequent Hellos must match the cached pubkey (else alarm). Sufficient for physically-secured IoT cluster.
 
 **Pattern Y summary:**
@@ -175,13 +175,19 @@ Boot:
   → for each peer: ECDH(my_priv, peer_pub) → HMAC-SHA256(shared, "PBFT-HMAC-v1")
   → store 6 HMAC keys in RAM (192 B)
 
-Runtime:
-  → HMAC-SHA256(hmac_key_peer, view||seq||type||payload) per message
-  → ~5 µs/msg (SHA HW)
+Periodic (every 24h, staggered by node_id × 1h):
+  psa_generate_key()                          // new keypair in RAM
+  → broadcast Hello (re-handshake marker)
+  → peers re-ECDH with new pubkey
+  → update hmac_keys[peer] (no peer restart needed)
 
 Peer restart:
   → restarted node broadcasts new Hello
   → peers re-ECDH on demand (soft re-handshake)
+
+Runtime:
+  → HMAC-SHA256(hmac_key_peer, view||seq||type||payload) per message
+  → ~5 µs/msg (SHA HW)
 ```
 
 ### 3.6 Why no blockchain?
@@ -240,7 +246,7 @@ pbft_core/
 │   ├── pbft_consensus.h        ← 3-phase consensus
 │   ├── pbft_viewchange.h       ← view-change protocol
 │   ├── pbft_checkpoint.h       ← checkpoint / GC
-│   ├── pbft_storage.h          ← NVS persistence
+│   ├── pbft_storage.h          ← NVS (config + view/seq + membership — NOT keys)
 │   └── pbft_log.h              ← logging + metrics
 ├── src/
 │   ├── pbft.c                  ← public API impl
@@ -367,6 +373,7 @@ This folder contains:
 | **View-change** | Protocol to rotate primary on suspected failure |
 | **New-view** | Message from new primary proving it has `2f+1` view-change votes |
 | **STS** | Station-to-Station protocol — ECDH authenticated by long-term ECDSA |
+| **Y-5** | Pattern Y variant with periodic key re-gen (every 24h, staggered) |
 | **HMAC** | Hash-based Message Authentication Code (RFC 2104) |
 | **HKDF** | HMAC-based Key Derivation Function (RFC 5869) |
 | **PSA Crypto** | Platform Security Architecture Crypto API (Arm standard) |
@@ -400,8 +407,8 @@ This folder contains:
 | 5 | Key exchange | ✅ **Decided** | Self-gen ECDSA P-256 via TRNG at boot, no persistence, ECDH → pairwise HMAC keys |
 | 6 | Concurrency model | 🟡 Open | Single-threaded + FreeRTOS event loop |
 | 7 | Network buffering | 🟡 Open | Static 2×4 KB (predictable) |
-| 8 | State persistence | 🟡 Open | NVS for config + view/seq (private key NOT persisted — Pattern Y) |
-| ~~9~~ | ~~Key rotation strategy~~ | ✅ **Resolved** | Not needed — restart = rotation (Pattern Y) |
+| 8 | State persistence | 🟡 Open | NVS for config + view/seq + membership (NO private key — Pattern Y) |
+| 9 | Key rotation strategy | ✅ **Decided** | Y-5: every 24h, staggered by node_id × 1h, soft re-handshake |
 
 ---
 
@@ -410,8 +417,8 @@ This folder contains:
 | Phase | Duration | Deliverable |
 |-------|----------|-------------|
 | 1. Core impl | 4 weeks | All 10 .c/.h files compile, single-node smoke test |
-| 2. Hardening | 2 weeks | Checkpoint, timeout mgmt, error handling |
-| 3. Testing | 2 weeks | Unit + integration + Byzantine + perf |
+| 2. Hardening | 2 weeks | Checkpoint, timeout mgmt, error handling, Y-5 periodic re-gen |
+| 3. Testing | 2 weeks | Unit + integration + Byzantine + perf (incl. 24h re-gen test) |
 | 4. Docs + tools | 2 weeks | Examples, deployment script, Doxygen |
 | **Total** | **~10 weeks** | Production-ready v1 |
 
