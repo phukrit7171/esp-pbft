@@ -310,7 +310,7 @@ This folder contains:
 |-----|--------|---------|
 | [HANDOVER.md](./HANDOVER.md) | 📝 Drafting | This file — 1-page project overview |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 📅 Next | System diagrams + sequence flows + state machines |
-| [CRYPTO.md](./CRYPTO.md) | 📅 Planned | Pattern C handshake, key lifecycle, MAC binding |
+| [CRYPTO.md](./CRYPTO.md) | 📅 Planned | Pattern Y handshake, key lifecycle, MAC binding |
 | [PROTOCOL.md](./PROTOCOL.md) | 📅 Planned | Wire format, `pbft_packet_t` byte layout |
 | [CONSENSUS.md](./CONSENSUS.md) | 📅 Planned | Pre-Prepare / Prepare / Commit detailed spec |
 | [VIEW-CHANGE.md](./VIEW-CHANGE.md) | 📅 Planned | Primary rotation algorithm |
@@ -330,7 +330,7 @@ This folder contains:
 
 ### Internal
 
-- Research report on authentication patterns (delegated 2026-06-26) — confirms Pattern C
+- Research report on authentication patterns (delegated 2026-06-26) — confirms Pattern Y (TRNG + ECDH-boot + HMAC-runtime)
 - ESP-IDF v6.0.1 local install at `~/.espressif/v6.0.1/esp-idf/` (Mbed TLS 4.0.0)
 - `idf_component.yml` declares `idf: ">=6.0.1"` and supported targets
 
