@@ -27,6 +27,7 @@ Build a **memory-optimized PBFT (Practical Byzantine Fault Tolerance) consensus 
 4. **Reusable** — extension hooks for blockchain / state-machine layer later
 5. **Transport-agnostic** — same PBFT wire format works on ESP-NOW or Wi-Fi UDP multicast; swap via Kconfig
 6. **Modern ESP-IDF** — PSA Crypto API (Mbed TLS 4.0), not deprecated `mbedtls_*`
+7. **Strict C style** — follow Zephyr MISRA-C subset + CERT C + ESP-IDF style (see [CODING_STANDARD.md](./CODING_STANDARD.md))
 
 ### 1.3 What is NOT in scope
 
@@ -37,6 +38,51 @@ Build a **memory-optimized PBFT (Practical Byzantine Fault Tolerance) consensus 
 | ❌ State machine / account model | App's responsibility |
 | ❌ Token / coin logic | App's responsibility |
 | ❌ Example apps (counter, KV) | v1 deliverable only; examples deferred |
+
+### 1.4 Coding standards (summary)
+
+Full detail in [CODING_STANDARD.md](./CODING_STANDARD.md). Top-3 ranked:
+
+| Rank | Adopted from | Why |
+|------|--------------|-----|
+| **1** | **Zephyr MISRA-C 2012 subset** (147 rules) | Modern, embedded-focused, open source |
+| **2** | **CERT C** | Security for crypto + memory + string safety |
+| **3** | **Linux kernel** (`goto cleanup`, no Hungarian) + **BSD KNF** macro hygiene | Proven patterns, readable |
+
+**Key conventions** (full list in §CODING_STANDARD):
+- C standard: **gnu23 (C23)** — supported by GCC 15.2 + ESP-IDF preferred
+- Indent: 4 spaces (ESP-IDF default, no tabs)
+- Line length: ≤120 chars
+- Header guards: `#pragma once` (ESP-IDF preferred)
+- Function size: ≤80 lines, ≤7 local variables
+- Naming: `pbft_` prefix for public, `s_` prefix for static (ESP-IDF style)
+- Types: use `<stdint.h>` (`uint32_t`, `uint64_t`) — never plain `int` for sizes/counters
+- Buffer types: use `uint8_t` for byte buffers — never plain `char`
+- Constants: decimal only — never octal (`0777` → typo)
+
+**Static analysis (CI gate)**:
+- `gcc -fanalyzer` (built-in, no install)
+- `cppcheck 2.17.1` (apt)
+- `clang-tidy 19` (apt)
+- `astyle 3.4.7` (formatter — match ESP-IDF style)
+
+**Anti-patterns banned (top 5 of 20)**:
+- A1: `malloc`/`calloc`/`realloc` in any PBFT handler (already enforced by §11 static memory)
+- A2: Ignoring `mbedtls_*` / `psa_*` return values
+- A3: `sprintf`/`printf` with non-literal format strings (RCE surface!)
+- A4: Pointer aliasing casts `(uint32_t *)bytes`
+- A6: Plain `int` for sizes/sequences — use `uint64_t` for view/sequence
+
+**Safe additional compiler flags** (component-private, do NOT conflict with ESP-IDF):
+```cmake
+target_compile_options(${COMPONENT_LIB} PRIVATE
+    -Wpedantic -Wshadow=local -Wstrict-prototypes
+    -Wmissing-prototypes -Wpointer-arith -Wcast-align
+    -Wnull-dereference -Wdouble-promotion -Wformat=2 -Wundef
+)
+```
+
+**AVOID** (conflict with ESP-IDF): `-Wconversion`, `-Wold-style-definition`, `-Wstrict-aliasing=3`
 
 ---
 
@@ -366,6 +412,7 @@ This folder contains:
 | [DEPLOYMENT.md](./DEPLOYMENT.md) | 📅 Planned | keygen, flash script, cluster init |
 | [ROADMAP.md](./ROADMAP.md) | 📅 Planned | Phased implementation plan |
 | [INDEX.md](./INDEX.md) | 📅 Final | Master index, written last |
+| [CODING_STANDARD.md](./CODING_STANDARD.md) | ✅ Done | Zephyr MISRA-C subset + CERT C + ESP-IDF style (47 KB) |
 
 ---
 
