@@ -494,10 +494,26 @@ _Static_assert(PBFT_HMAC_KEY_BYTES == 32,              "HMAC-SHA256 key size mus
 _Static_assert(PBFT_DIGEST_BYTES == 32,                "SHA-256 digest size must be 32");
 _Static_assert(PBFT_PUBKEY_BYTES == 65,                "P-256 uncompressed pubkey must be 65 B (0x04 ‖ X_BE ‖ Y_BE)");
 
-// === Transport ===
+// === Transport (compile-time only — no runtime fallback) ===
 #ifdef CONFIG_PBFT_TRANSPORT_ESP_NOW
+// If ESP-NOW is selected, Pre-Prepare with max payload MUST fit in 250 B.
+// No runtime fallback to UDP exists (user requirement). Either reduce
+// PBFT_TX_PAYLOAD_MAX, or switch to CONFIG_PBFT_TRANSPORT_WIFI_UDP=y.
+// Note: View-Change can also exceed 250 B (up to 4 KB worst case at
+// PBFT_VC_MAX_PREPARED=100); if ESP-NOW is selected with that config,
+// build will fail here.
 _Static_assert(PBFT_TX_PAYLOAD_MAX + 82 <= 250,
-               "Pre-Prepare with max payload exceeds ESP-NOW 250 B limit");
+               "Pre-Prepare with max payload exceeds ESP-NOW 250 B limit — "
+               "either reduce PBFT_TX_PAYLOAD_MAX or select "
+               "CONFIG_PBFT_TRANSPORT_WIFI_UDP=y (compile-time only, no runtime fallback)");
+_Static_assert(sizeof(pbft_view_change_t) + PBFT_VC_MAX_PREPARED * 40 <= 250,
+               "View-Change worst case exceeds ESP-NOW 250 B — "
+               "either reduce PBFT_VC_MAX_PREPARED or select "
+               "CONFIG_PBFT_TRANSPORT_WIFI_UDP=y (compile-time only, no runtime fallback)");
+// New-View (~5.9 KB worst case) NEVER fits in ESP-NOW. If ESP-NOW is
+// selected, view-change is impossible and the cluster is stuck on view 0.
+// This is by design (user requirement: no runtime fallback). To enable
+// view-change, select CONFIG_PBFT_TRANSPORT_WIFI_UDP=y.
 #endif
 
 // === Memory totals ===

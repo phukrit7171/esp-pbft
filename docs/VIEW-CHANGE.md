@@ -296,12 +296,12 @@ void pbft_send_view_change(uint32_t new_view) {
                      (uint8_t*)&vc + 4, vc_size - 4 - 32,  // everything except common header and trailing MAC
                      ((uint8_t*)&vc) + vc_size - 32);
 
-    // Send (UDP if too big)
-    if (vc_size > 250) {
-        udp_transport.broadcast(&vc, vc_size);
-    } else {
-        default_transport->broadcast(&vc, vc_size);
-    }
+    // No runtime fallback. Transport chosen at compile time.
+    // If CONFIG_PBFT_TRANSPORT_ESP_NOW=y and vc_size > 250, this returns
+    // PBFT_NET_ERR_INVALID from espnow_broadcast() (defensive runtime check;
+    // the _Static_assert in MEMORY.md should catch this at compile time
+    // when PBFT_VC_MAX_PREPARED is large).
+    (void)default_transport->broadcast(&vc, vc_size);
 
     // Local state
     view_state.phase = PBFT_VIEW_PHASE_CHANGING;

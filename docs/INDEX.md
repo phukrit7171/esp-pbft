@@ -105,7 +105,7 @@ This is the master index for the esp-pbft design and implementation documentatio
 - ESP-NOW vs Wi-Fi UDP comparison → [PROTOCOL.md](./PROTOCOL.md) §3
 - ESP-NOW impl → [PROTOCOL.md](./PROTOCOL.md) §2.2
 - Wi-Fi UDP impl + power-save → [PROTOCOL.md](./PROTOCOL.md) §2.3 + [POWER.md](./POWER.md) §12
-- ESP-NOW 250 B size limit + UDP fallback → [PROTOCOL.md](./PROTOCOL.md) §8
+- ESP-NOW 250 B size limit (no runtime fallback) → [PROTOCOL.md](./PROTOCOL.md) §8
 - Wire format / byte layout → [PROTOCOL.md](./PROTOCOL.md) §4-6
 - MAC binding (view+seq+type+digest+payload) → [CRYPTO.md](./CRYPTO.md) §5.1
 

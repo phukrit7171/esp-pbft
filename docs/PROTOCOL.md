@@ -4,6 +4,16 @@
 > **Scope:** Wire format, transport abstraction, byte layout, addressing
 > **Out of scope:** Crypto internals → [CRYPTO.md](./CRYPTO.md), consensus state machine → [CONSENSUS.md](./CONSENSUS.md)
 
+> ⚠️ **CRITICAL DESIGN CONSTRAINT (no runtime fallback):** esp-pbft does **NOT**
+> fall back from ESP-NOW to Wi-Fi UDP at runtime. The transport is a
+> **compile-time** choice only, via the mutually-exclusive `choice PBFT_TRANSPORT`
+> Kconfig block: either `CONFIG_PBFT_TRANSPORT_ESP_NOW=y` or
+> `CONFIG_PBFT_TRANSPORT_WIFI_UDP=y`. There is **no** "ESP-NOW with UDP fallback"
+> or "dual-transport runtime" mode. An oversized message on the selected transport
+> returns `PBFT_NET_ERR_INVALID` at runtime and the build's `_Static_assert`s
+> prevent this at compile time (see [MEMORY.md §X](./MEMORY.md)). See §8.1 below
+> for the rationale and the consequences for New-View support.
+
 ---
 
 ## 1. Overview
@@ -12,7 +22,7 @@ esp-pbft messages are exchanged over a **transport-agnostic abstraction** with t
 - **ESP-NOW** (default) — peer-to-peer broadcast, no AP
 - **Wi-Fi UDP multicast** — AP + IGMP group
 
-All messages share a **common wire format** regardless of transport. Switching transport at Kconfig time does NOT change the PBFT protocol semantics.
+All messages share a **common wire format** regardless of transport. Switching transport at Kconfig time does NOT change the PBFT protocol semantics. **The transport choice is fixed at compile time and cannot be changed at runtime.**
 
 ---
 
@@ -453,34 +463,51 @@ For every message except Hello-initial, MAC input = `view ‖ sequence ‖ msg_t
 
 ### 8.1 Solutions for oversized messages
 
-**Option A: Wi-Fi UDP for oversized messages** (recommended)
-- ESP-NOW for normal 3-phase messages
-- Wi-Fi UDP for New-View (and Pre-Prepare with >250 B payload)
-- Application decides per-message which transport to use
+> ⚠️ **Design constraint (user requirement, no runtime fallback):** esp-pbft does
+> **NOT** fall back from ESP-NOW to UDP at runtime. The transport is a
+> **compile-time** choice via `CONFIG_PBFT_TRANSPORT_ESP_NOW=y` or
+> `CONFIG_PBFT_TRANSPORT_WIFI_UDP=y` (mutually exclusive in a `choice` block).
+> An oversized message over ESP-NOW returns `PBFT_NET_ERR_INVALID` at runtime
+> and the caller must reconfigure at compile time if New-View or large
+> Pre-Prepare payloads are required.
 
-**Option B: Fragmentation** (complex)
+**Option A: Compile-time choice of Wi-Fi UDP** (recommended for New-View support)
+- Set `CONFIG_PBFT_TRANSPORT_WIFI_UDP=y` at compile time
+- All messages (including New-View) use UDP multicast/unicast
+- Selected when New-View (5.9 KB worst case) or Pre-Prepare with full
+  `PBFT_TX_PAYLOAD_MAX = 256 B` payload (338 B) must be supported
+
+**Option B: ESP-NOW only with payload size cap** (for minimal-RAM builds)
+- Set `CONFIG_PBFT_TRANSPORT_ESP_NOW=y` and reduce `PBFT_TX_PAYLOAD_MAX` to ≤168 B
+  so Pre-Prepare fits within 250 B
+- **New-View is NOT supported in this configuration** — view-change is impossible;
+  the cluster is permanently stuck on view 0 if the primary fails. Acceptable only
+  for single-primary deployments where the primary cannot fail (e.g., AP node is
+  externally powered and is the primary by design).
+- A `_Static_assert` (see [MEMORY.md §X](./MEMORY.md)) checks at compile time:
+  if ESP-NOW is selected and `PBFT_TX_PAYLOAD_MAX + 82 > 250`, build fails.
+
+**Option C: Fragmentation** (rejected — see Open Questions P2)
 - Split large messages across multiple ESP-NOW packets
 - Adds reassembly code, sequence numbers, timeouts
 - Not recommended for v1
 
-**Option C: Cap TX payload size**
-- Reduce `PBFT_TX_PAYLOAD_MAX` to ~150 B
-- New-View still too big — need UDP anyway
-- Not recommended
+**Decision:** **Option A or B at compile time** — no runtime fallback. The Kconfig
+`choice` enforces mutual exclusion; `_Static_assert` enforces payload size at
+compile time; `espnow_broadcast()` returns `PBFT_NET_ERR_INVALID` at runtime if a
+malicious or buggy caller violates the compile-time constraint.
 
-**Decision:** **Option A** — esp-pbft uses **Wi-Fi UDP for New-View** even when ESP-NOW is the default transport for normal messages. This is documented in the transport abstraction.
-
-### 8.2 Dual-transport runtime
+### 8.2 Single-transport runtime (compile-time-selected)
 
 ```c
 esp_err_t pbft_send_pre_prepare(const pbft_msg_t* msg) {
     size_t total_len = msg->payload_len + 82;  // 82 = header overhead
-    if (total_len > 250 && pbft_default_transport == &pbft_transport_espnow) {
-        // Fallback to UDP for oversized messages
-        return udp_transport.broadcast(msg, total_len);
-    }
+    // No runtime fallback. The chosen transport was decided at compile time.
+    // If ESP-NOW is selected and total_len > 250, this returns PBFT_NET_ERR_INVALID
+    // (defensive runtime check; should be unreachable if _Static_assert passed).
     return pbft_default_transport->broadcast(msg, total_len);
 }
+```
 
 esp_err_t pbft_send_new_view(const pbft_new_view_t* nv) {
     // Always use UDP — New-View doesn't fit in ESP-NOW

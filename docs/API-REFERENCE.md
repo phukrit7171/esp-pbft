@@ -536,7 +536,7 @@ Each `pbft_send_*` function:
 
 1. Serializes the struct to wire format (packed, little-endian).
 2. Computes HMAC over the MAC input (CRYPTO.md §5.1) using the appropriate HMAC key (broadcast = primary's key for outgoing, peer-specific key for incoming).
-3. Dispatches via the selected transport (PROTOCOL.md §2). May fall back to UDP for oversized messages.
+3. Dispatches via the selected transport (PROTOCOL.md §2). **No runtime fallback** — transport is chosen at compile time (see [PROTOCOL.md §8.1](./PROTOCOL.md#81-solutions-for-oversized-messages) for the constraint rationale).
 4. Returns `ESP_OK` on enqueue (delivery is async — send_cb fires later).
 
 `pbft_resend_*` variants are used by the timeout/retry logic in CONSENSUS.md §6.3; they re-send the **same message** (no new MAC needed because the MAC is over the message content which is unchanged).
