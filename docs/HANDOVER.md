@@ -2,8 +2,8 @@
 
 > **Project:** esp-pbft — lightweight PBFT consensus core library for ESP32-C3 clusters
 > **Version:** 1.0 (design complete, implementation pending)
-> **Date:** 2026-06-26
-> **Status:** 🟡 Design in progress — see [INDEX.md](./INDEX.md) for completion status
+> **Date:** 2026-06-27
+> **Status:** ✅ Design complete — see [INDEX.md](./INDEX.md) for the full document map
 > **Target hardware:** ESP32-C3 (RISC-V, 160 MHz, 400 KB SRAM, no PSRAM)
 > **ESP-IDF:** v6.0.1 (Mbed TLS 4.0.0 + TF-PSA-Crypto)
 
@@ -266,23 +266,39 @@ esp-pbft is the consensus layer; the blockchain layer (if needed later) can be a
 
 ### 3.7 Memory budget (verified for ESP32-C3, no PSRAM)
 
+**Reconciled 2026-06-27** (corrects earlier conflicting figures — see [DESIGN-AUDIT.md §A5](./DESIGN-AUDIT.md)).
+
 | Component | Size | Notes |
 |-----------|------|-------|
-| PBFT log (pending TX) | ~6 KB | 100 entries × 60 B |
-| Membership config | ~1 KB | 7 nodes × 140 B |
-| Crypto contexts (PSA) | ~7–12 KB | ECDH + ECDSA gen + HMAC + PSA core |
-| HMAC keys (derived) | 192 B | 6 peers × 32 B (RAM only, regenerated each boot) |
-| ECDSA private key (boot) | ~700 B | RAM only, regenerated each boot |
-| Network buffers | ~8 KB | 2 × 4 KB TX/RX (same for both transports) |
-| Transport stack (ESP-NOW) | ~15 KB | esp_now component + Wi-Fi driver (lightweight) |
-| Transport stack (Wi-Fi UDP) | ~45 KB | esp_wifi + lwIP + IGMP + sockets (heavier) |
-| Persistent state | ~1 KB | view, sequence, last checkpoint |
-| **Total used (ESP-NOW build)** | **~40 KB** | **~10% of 400 KB** |
-| **Total used (Wi-Fi UDP build)** | **~70 KB** | **~17.5% of 400 KB** |
-| **Free (ESP-NOW)** | **~360 KB** | 90% |
-| **Free (Wi-Fi UDP)** | **~330 KB** | 82.5% |
+| PBFT log (pending TX) | **~36 KB** | 100 entries × ~360 B (inline 256 B payload + state) |
+| Membership config | ~1 KB | 7 nodes × ~140 B |
+| Crypto contexts (PSA) | ~3 KB | ECDH + ECDSA gen + HMAC + PSA core |
+| HMAC keys (derived) | ~280 B | 6 peers × ~32 B + handles |
+| ECDSA private key (boot) | ~32 B | RAM only, regenerated each boot |
+| Peer pubkey cache (TOFU) | ~487 B | 6 peers × 65 B (0x04 ‖ X_BE ‖ Y_BE) + PSA key handles |
+| Network buffers | ~16 KB | 4 KB TX + 4 KB RX + 8 KB arena |
+| Dedup cache (audit B10) | ~10 KB | 256 executed digests |
+| TX queue (for `submit_from_isr`) | ~4.5 KB | 16 entries × ~280 B |
+| View state + V-set arena | ~5 KB | single view state + 7 × 488 B VC slots |
+| Checkpoint proofs | ~640 B | 8 in-flight proofs |
+| Misc (metrics, config, etc.) | ~260 B | — |
+| **Subtotal esp-pbft source (BSS)** | **~72 KB** | ~18% of 400 KB |
+| | | |
+| ESP-IDF Wi-Fi driver | ~15-25 KB | depends on transport |
+| ESP-NOW component | ~5 KB | always linked |
+| FreeRTOS core | ~10 KB | — |
+| PSA crypto core | ~10 KB | — |
+| lwIP (excluded for ESP-NOW build via `CONFIG_LWIP_ENABLE=n`) | 0 (excluded) / ~45 KB (Wi-Fi UDP) | |
+| Other ESP-IDF | ~5 KB | |
+| **Subtotal ESP-IDF (ESP-NOW build, no lwIP)** | **~45 KB** | |
+| **Subtotal ESP-IDF (Wi-Fi UDP build)** | **~100 KB** | |
+| | | |
+| **Grand total (ESP-NOW build)** | **~117 KB** | **~29% of 400 KB** |
+| **Grand total (Wi-Fi UDP build)** | **~177 KB** | **~44% of 400 KB** |
+| **Free (ESP-NOW)** | **~283 KB** | 71% |
+| **Free (Wi-Fi UDP)** | **~223 KB** | 56% |
 
-See [MEMORY.md](./MEMORY.md) for detailed layout.
+See [MEMORY.md](./MEMORY.md) for the detailed per-module layout, `static_assert` catalog, and NVS schema.
 
 ### 3.8 Power budget (per transport)
 
@@ -349,20 +365,22 @@ esp-pbft/
 
 ### 4.1 Implementation status
 
-**Design overview:** high-level (covered in this file)
-**Detailed design:** see per-component docs (mostly TBD)
+**Design:** complete across all 17 documents.
+**Implementation:** pending (Phase 1 of [ROADMAP.md](./ROADMAP.md) not started).
 
 | Component | High-level | Detailed | Implementation | Tests |
 |-----------|-----------|----------|----------------|-------|
-| Types & config | ✅ In HANDOVER | 🟡 TBD (API-REFERENCE) | ❌ 0% | ❌ 0% |
-| Crypto | ✅ In HANDOVER | 🟡 TBD (CRYPTO.md) | ❌ 0% | ❌ 0% |
-| Network | ✅ In HANDOVER | 🟡 TBD (PROTOCOL.md) | ❌ 0% | ❌ 0% |
-| Membership | ✅ In HANDOVER | 🟡 TBD (API-REFERENCE) | ❌ 0% | ❌ 0% |
-| Consensus | ✅ In HANDOVER | 🟡 TBD (CONSENSUS.md) | ❌ 0% | ❌ 0% |
-| View-Change | ✅ In HANDOVER | 🟡 TBD (VIEW-CHANGE.md) | ❌ 0% | ❌ 0% |
-| Checkpoint | ✅ In HANDOVER | 🟡 TBD (CHECKPOINT.md) | ❌ 0% | ❌ 0% |
-| Storage | ✅ In HANDOVER | 🟡 TBD (MEMORY.md) | ❌ 0% | ❌ 0% |
-| Logging | ✅ In HANDOVER | 🟡 TBD (API-REFERENCE) | ❌ 0% | ❌ 0% |
+| Types & config | ✅ In HANDOVER | ✅ API-REFERENCE §2 | ❌ 0% | ❌ 0% |
+| Crypto | ✅ In HANDOVER | ✅ CRYPTO.md | ❌ 0% | ❌ 0% |
+| Network | ✅ In HANDOVER | ✅ PROTOCOL.md | ❌ 0% | ❌ 0% |
+| Membership | ✅ In HANDOVER | ✅ API-REFERENCE + MEMORY | ❌ 0% | ❌ 0% |
+| Consensus | ✅ In HANDOVER | ✅ CONSENSUS.md | ❌ 0% | ❌ 0% |
+| View-Change | ✅ In HANDOVER | ✅ VIEW-CHANGE.md | ❌ 0% | ❌ 0% |
+| Checkpoint | ✅ In HANDOVER | ✅ CHECKPOINT.md | ❌ 0% | ❌ 0% |
+| Storage | ✅ In HANDOVER | ✅ MEMORY.md §4 | ❌ 0% | ❌ 0% |
+| Logging | ✅ In HANDOVER | ✅ API-REFERENCE §4.5 | ❌ 0% | ❌ 0% |
+| Power mgmt | ✅ In HANDOVER | ✅ POWER.md | ❌ 0% | ❌ 0% |
+| Failure handling | ✅ In HANDOVER | ✅ FAILURE-MODES.md | ❌ 0% | ❌ 0% |
 
 ---
 
@@ -393,25 +411,26 @@ See [API-REFERENCE.md](./API-REFERENCE.md) for error codes, parameter validation
 
 ## 6. Documentation map
 
-This folder contains:
+This folder contains 17 design documents totalling ~340 KB. See [INDEX.md](./INDEX.md) for the full index.
 
 | Doc | Status | Purpose |
 |-----|--------|---------|
-| [HANDOVER.md](./HANDOVER.md) | 📝 Drafting | This file — 1-page project overview |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) | 📅 Next | System diagrams + sequence flows + state machines |
-| [CRYPTO.md](./CRYPTO.md) | 📅 Planned | Pattern Y handshake, key lifecycle, MAC binding |
-| [PROTOCOL.md](./PROTOCOL.md) | 📅 Planned | Wire format, `pbft_packet_t` byte layout |
-| [CONSENSUS.md](./CONSENSUS.md) | 📅 Planned | Pre-Prepare / Prepare / Commit detailed spec |
-| [VIEW-CHANGE.md](./VIEW-CHANGE.md) | 📅 Planned | Primary rotation algorithm |
-| [CHECKPOINT.md](./CHECKPOINT.md) | 📅 Planned | Stable checkpoint + catch-up protocol |
-| [API-REFERENCE.md](./API-REFERENCE.md) | 📅 Planned | Full public API contract |
-| [MEMORY.md](./MEMORY.md) | 📅 Planned | Memory layout + budget breakdown |
-| [POWER.md](./POWER.md) | 📅 Planned | Power state transitions + measurements |
-| [FAILURE-MODES.md](./FAILURE-MODES.md) | 📅 Planned | Byzantine scenarios + partition analysis |
-| [TEST-PLAN.md](./TEST-PLAN.md) | 📅 Planned | Unit / integration / Byzantine / perf tests |
-| [DEPLOYMENT.md](./DEPLOYMENT.md) | 📅 Planned | keygen, flash script, cluster init |
-| [ROADMAP.md](./ROADMAP.md) | 📅 Planned | Phased implementation plan |
-| [INDEX.md](./INDEX.md) | 📅 Final | Master index, written last |
+| [HANDOVER.md](./HANDOVER.md) | ✅ Done | This file — 1-page project overview |
+| [DESIGN-AUDIT.md](./DESIGN-AUDIT.md) | ✅ Done | Cross-doc consistency check (2026-06-27) |
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | ✅ Done | System diagrams + sequence flows + state machines |
+| [CRYPTO.md](./CRYPTO.md) | ✅ Done | Pattern Y handshake, key lifecycle, MAC binding |
+| [PROTOCOL.md](./PROTOCOL.md) | ✅ Done | Wire format, `pbft_packet_t` byte layout |
+| [CONSENSUS.md](./CONSENSUS.md) | ✅ Done | Pre-Prepare / Prepare / Commit detailed spec |
+| [VIEW-CHANGE.md](./VIEW-CHANGE.md) | ✅ Done | Primary rotation, V-set/O-set, New-View verification |
+| [CHECKPOINT.md](./CHECKPOINT.md) | ✅ Done | Stable checkpoint + GC + state transfer |
+| [API-REFERENCE.md](./API-REFERENCE.md) | ✅ Done | Full public C API contract + error codes |
+| [MEMORY.md](./MEMORY.md) | ✅ Done | Per-module layout + static_assert catalog |
+| [POWER.md](./POWER.md) | ✅ Done | Power state machine + Wi-Fi PS modem mode |
+| [FAILURE-MODES.md](./FAILURE-MODES.md) | ✅ Done | Byzantine scenarios + recovery playbook |
+| [TEST-PLAN.md](./TEST-PLAN.md) | ✅ Done | Unit / integration / Byzantine / perf / soak tests |
+| [DEPLOYMENT.md](./DEPLOYMENT.md) | ✅ Done | NVS provisioning + OTA + Y-5 runbook |
+| [ROADMAP.md](./ROADMAP.md) | ✅ Done | Phased implementation plan (P1-P5) |
+| [INDEX.md](./INDEX.md) | ✅ Done | Master index |
 | [CODING_STANDARD.md](./CODING_STANDARD.md) | ✅ Done | Zephyr MISRA-C subset + CERT C + ESP-IDF style (47 KB) |
 
 ---

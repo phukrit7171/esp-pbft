@@ -67,7 +67,7 @@ static pbft_net_err_t espnow_init(const pbft_net_config_t* cfg) {
     for (int i = 0; i < PBFT_CLUSTER_SIZE; i++) {
         if (i == cfg->my_node_id) continue;
         esp_now_peer_info_t peer = {
-            .peer_addr = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF},  // broadcast
+            .peer_addr = PBFT_ESP_NOW_BROADCAST_MAC,   // all-FF
             .channel = 0,
             .encrypt = false,  // HMAC at PBFT layer, CCMP at ESP-NOW
         };
@@ -78,16 +78,25 @@ static pbft_net_err_t espnow_init(const pbft_net_config_t* cfg) {
 
 static pbft_net_err_t espnow_broadcast(const void* buf, size_t len) {
     if (len > 250) return PBFT_NET_ERR_INVALID;  // ESP-NOW limit
-    return esp_now_send(PEER_BROADCAST_ADDR, buf, len) == ESP_OK
+    return esp_now_send(PBFT_ESP_NOW_BROADCAST_MAC, buf, len) == ESP_OK
            ? PBFT_NET_OK : PBFT_NET_ERR_FULL;
 }
 ```
 
 **Size constraint:** ESP-NOW max payload = **250 bytes** (verified for ESP32-C3).
 
+The `PBFT_ESP_NOW_BROADCAST_MAC` constant is defined in `pbft_network_espnow.h`:
+
+```c
+#define PBFT_ESP_NOW_BROADCAST_MAC   { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }
+#define PBFT_ESP_NOW_MAX_PAYLOAD     250
+#define PBFT_UDP_MTU                 1500
+#define PBFT_UDP_MAX_PAYLOAD         1472
+```
+
 ### 2.3 Wi-Fi UDP implementation (`pbft_network_wifi_udp.c`)
 
-**API used:** `socket()`, `sendto()`, `setsockopt(IP_ADD_MEMBERSHIP)`, `esp_wifi_set_mode(WIFI_MODE_AP)`
+**API used:** `socket()`, `sendto()`, `setsockopt(IP_ADD_MEMBERSHIP)`, `esp_wifi_set_mode(WIFI_MODE_AP)`, `esp_wifi_set_ps()`
 
 ```c
 #define PBFT_MCAST_GROUP  "239.42.0.7"   // site-local, scoped
@@ -100,7 +109,10 @@ static pbft_net_err_t wifi_udp_init(const pbft_net_config_t* cfg) {
     esp_wifi_set_config(/* SSID, channel, etc. */);
     esp_wifi_start();
 
-    // 2. Create UDP socket
+    // 2. Apply power-save mode per role (see POWER.md §11)
+    wifi_udp_set_role(cfg->my_node_id == 0);
+
+    // 3. Create UDP socket
     int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
@@ -123,6 +135,31 @@ static pbft_net_err_t wifi_udp_init(const pbft_net_config_t* cfg) {
 ```
 
 **Size constraint:** UDP max payload = **65,507 bytes** (IP MTU 1500 in practice → ~1472 bytes).
+
+**Power-save modem mode (mandatory):** AP node → `WIFI_PS_NONE`; STA nodes → `WIFI_PS_MIN_MODEM`. Without this, Wi-Fi UDP build draws ~160 mA continuously; with `WIFI_PS_MIN_MODEM`, STA current drops to 30-60 mA. Full rationale, Kconfig, and edge cases in [POWER.md §11](./POWER.md#11-wi-fi-udp-power-save-modem-mode).
+
+### 2.5 UDP multicast vs unicast fan-out — AP multicast-cache limitation
+
+> ⚠️ **Espressif hardware limitation (verified, all targets):** "Currently, ESP32 AP does not support all of the power-saving feature defined in Wi-Fi specification. To be specific, **the AP only caches unicast data for the stations** connect to this AP, **but does not cache the multicast data for the stations**. If stations connected to the ESP32 AP are power-saving enabled, they may experience **multicast packet loss**."
+> — [Espressif Wi-Fi power-save guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/wifi-driver/wifi-performance-and-power-save.html), applies verbatim to ESP32 / S2 / S3 / S31 / C2 / C3 / C5 / C6 / C61.
+
+**Consequence for esp-pbft:** if we use **group UDP multicast** for Prepare/Commit, STAs in modem-sleep (the entire esp-pbft power-saving design) will lose messages. This is a **P0 liveness bug** — quorum (2f+1 = 5 of 7) may not be reached even with f=0 faulty replicas.
+
+**Mitigation chosen:** UDP transport uses **unicast-fan-out** for Prepare/Commit (one `sendto()` per peer, collecting ACKs into the quorum set). ESP-NOW transport keeps broadcast (no AP involved, no multicast-cache limitation). The `pbft_transport_t.unicast()` hook in §2.1 already supports this; no transport-API change required.
+
+**Kconfig:**
+
+```kconfig
+config PBFT_UDP_FANOUT_MODE_UNICAST
+    bool "Wi-Fi UDP: unicast fan-out (recommended)"
+    default y
+    help
+      Sends Prepare and Commit via 6 unicast UDP packets (one per peer).
+      This is MANDATORY for power-saving: Espressif AP firmware does not
+      cache multicast frames for sleeping STAs, so multicast Prepare/Commit
+      would be lost under WIFI_PS_MIN_MODEM.
+      See PROTOCOL.md §2.5 and Espressif wifi-performance-and-power-save.html.
+```
 
 ### 2.4 Common receive callback signature
 
@@ -151,6 +188,7 @@ The `sender_id` is extracted from the packet header (§4), NOT from MAC/IP — t
 | **Address** | MAC (6 B) | IPv4 (4 B) + port |
 | **Transport header** | 24 B (802.11) | 28-54 B (IP+UDP) |
 | **Default** | ✅ chosen | — |
+| **PBFT Prepare/Commit** | broadcast | **unicast-fan-out** (see §2.5) |
 
 **Decision rationale:** see [HANDOVER.md §3.3](./HANDOVER.md).
 
@@ -189,17 +227,20 @@ All multi-byte fields are **little-endian** (ESP32-C3 is RISC-V, native LE).
 
 ## 5. Message types
 
-| Type ID | Name | Direction | Size |
-|---------|------|-----------|------|
-| 0 | `PBFT_MSG_HELLO` | bidirectional (bootstrap) | 4 + 67 + 32 = **103 B** |
-| 1 | `PBFT_MSG_PRE_PREPARE` | primary → all | 4 + 12 + 32 + payload_len + 32 = **80 + payload B** |
-| 2 | `PBFT_MSG_PREPARE` | all → all | 4 + 12 + 32 + 32 = **80 B** |
-| 3 | `PBFT_MSG_COMMIT` | all → all | 4 + 12 + 32 + 32 = **80 B** |
-| 4 | `PBFT_MSG_VIEW_CHANGE` | all → all | 4 + 12 + 32 + 8 + 32 = **88 B** |
-| 5 | `PBFT_MSG_NEW_VIEW` | new primary → all | 4 + 12 + var + 32 = **48 + var B** |
-| 6 | `PBFT_MSG_CHECKPOINT` | all → all | 4 + 12 + 32 + 8 + 32 = **88 B** |
+| Type ID | Name | Direction | Size (typical) | Defined in |
+|---------|------|-----------|----------------|------------|
+| 0 | `PBFT_MSG_HELLO` | bidirectional (bootstrap) | 4 + 68 + 32 = **104 B** | §6.1 |
+| 1 | `PBFT_MSG_PRE_PREPARE` | primary → all | 4 + 4 + 8 + 32 + 2 + payload + 32 = **82 + payload B** | §6.2 |
+| 2 | `PBFT_MSG_PREPARE` | all → all | 4 + 4 + 8 + 32 + 32 = **80 B** | §6.3 |
+| 2 | `PBFT_MSG_PREPARE` | all → all | 4 + 4 + 8 + 32 + 32 = **80 B** | §6.3 |
+| 3 | `PBFT_MSG_COMMIT` | all → all | 4 + 4 + 8 + 32 + 32 = **80 B** | §6.4 |
+| 4 | `PBFT_MSG_VIEW_CHANGE` | all → all | 4 + 88 + n_prepared × 40 = **88–4088 B** | §6.5 + [VIEW-CHANGE.md §4.3](./VIEW-CHANGE.md) |
+| 5 | `PBFT_MSG_NEW_VIEW` | new primary → all | var (always UDP) ≈ **2.5–6 KB** | §6.6 + [VIEW-CHANGE.md §4.4](./VIEW-CHANGE.md) |
+| 6 | `PBFT_MSG_CHECKPOINT` | all → all | 4 + 8 + 32 + 32 = **76 B** | §6.7 + [CHECKPOINT.md §5](./CHECKPOINT.md) |
+| 7 | `PBFT_MSG_STATE_REQUEST` | replica → peer | 4 + 4 + 8 + 32 = **48 B** | [CHECKPOINT.md §8](./CHECKPOINT.md) |
+| 8 | `PBFT_MSG_STATE_RESPONSE` | replica → requesting peer | 4 + 4 + 8 + var + 32 = **48+ B** | [CHECKPOINT.md §8](./CHECKPOINT.md) |
 
-Reserved: 7-255 (MBZ).
+Reserved: 9-255 (MBZ).
 
 All messages except Hello include a 32-byte HMAC trailer (see §6).
 
@@ -218,7 +259,9 @@ Used for cluster discovery + soft re-handshake (Pattern Y-5).
   |        common header (msg_type=0, sender_id, reserved)        |
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
   |                                                               |
-  |                  pubkey (64 bytes, P-256)                     |
+  |                                                               |
+  |          pubkey (65 bytes: 0x04 ‖ X_BE(32) ‖ Y_BE(32))        |
+  |                                                               |
   |                                                               |
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
   |                  re_handshake (1 byte)                        |
@@ -228,7 +271,7 @@ Used for cluster discovery + soft re-handshake (Pattern Y-5).
   |                                                               |
   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-  Total: 4 + 64 + 1 + 32 = 101 bytes (+ 2 padding = 103 if needed)
+  Total: 4 + 65 + 1 + 32 = 102 bytes (+ 2 padding = 104 if needed)
 ```
 
 | Field | Size | Notes |
@@ -236,11 +279,13 @@ Used for cluster discovery + soft re-handshake (Pattern Y-5).
 | `msg_type` | 1 B | = 0 (PBFT_MSG_HELLO) |
 | `sender_id` | 1 B | 0..6 |
 | `reserved` | 2 B | MBZ |
-| `pubkey` | 64 B | uncompressed P-256 (X ‖ Y, 32 B each) |
+| `pubkey` | 65 B | uncompressed P-256: `0x04` (1 B) ‖ `X` (32 B, big-endian) ‖ `Y` (32 B, big-endian). Matches `psa_export_public_key()` output verbatim and `psa_import_key()` requirement for `PSA_KEY_TYPE_ECC_PUBLIC_KEY(SECP_R1)`. |
 | `re_handshake` | 1 B | 0 = first hello, 1 = re-handshake marker |
 | `mac` | 32 B | HMAC-SHA256 over (common header ‖ pubkey ‖ re_handshake) using current `hmac_keys[sender_id]` if known, or zero-filled if first hello (TOFU) |
 
 **Encoding note:** To avoid padding, structure is `__attribute__((packed))` and serialized manually. The `reserved` field is included so the MAC input starts at a 4-byte boundary.
+
+**PSA wire format reference:** Verified against esp-idf master `components/mbedtls/test_apps/.../test_psa_ecdsa.c:700-705`, `components/bt/esp_ble_mesh/common/crypto_psa.c:419-432`, `components/wpa_supplicant/esp_supplicant/src/crypto/crypto_mbedtls-ec.c:1714-1822`, `components/bt/controller/esp32c6/bt.c:1699-1740`. If a peer sends 33-byte compressed (0x02/0x03 ‖ X), the receiver must rehydrate to 65-byte uncompressed before calling `psa_import_key()`.
 
 ### 6.2 Pre-Prepare (`PBFT_MSG_PRE_PREPARE`, type 1)
 
@@ -305,10 +350,15 @@ Replica confirms it has reached `prepared` state.
 
 Sent when replica suspects primary is faulty.
 
+**Canonical wire format is in [VIEW-CHANGE.md §4.3](./VIEW-CHANGE.md)** — includes the **prepared-set** (`n_prepared : uint8` + `n_prepared × {seq:u64, digest:32}`) required for the new primary to construct the O-set. The summary here is a preview; defer to VIEW-CHANGE.md for byte-exact layout.
+
 ```
    common header (type=4) | view (4) | new_view (4) | checkpoint_seq (8) |
-   checkpoint_digest (32) | mac (32)
-   Total: 4 + 4 + 4 + 8 + 32 + 32 = 84 bytes (+ 4 padding = 88 if needed)
+   checkpoint_digest (32) | n_prepared (1) | reserved (3) |
+   {prepared_entry: n_prepared × (8 + 32)} | mac (32)
+
+   Empty prepared-set: 4 + 4 + 4 + 8 + 32 + 1 + 3 + 32 = 88 bytes
+   Worst case (n_prepared=100): 88 + 100 × 40 = 4088 bytes → UDP only
 ```
 
 | Field | Size | Notes |
@@ -317,31 +367,51 @@ Sent when replica suspects primary is faulty.
 | `new_view` | 4 B | next view to transition to |
 | `checkpoint_seq` | 8 B | last stable checkpoint sequence number |
 | `checkpoint_digest` | 32 B | digest of app state at checkpoint |
-| `mac` | 32 B | HMAC |
+| `n_prepared` | 1 B | number of prepared entries (0..PBFT_VC_MAX_PREPARED, default 10) |
+| prepared entries | 0–4000 B | each is `{seq:u64, digest:32}` = 40 B |
+| `mac` | 32 B | HMAC over header + body (no MAC trailer on entries) |
+
+**Kconfig:**
+
+```kconfig
+config PBFT_VC_MAX_PREPARED
+    int "Max prepared entries carried in a View-Change"
+    default 10
+    range 0 100
+    help
+      Caps the worst-case View-Change size. With n_prepared=10 the
+      worst-case VC = 488 B (still fits ESP-NOW); with 100 it's 4088 B
+      (forces UDP). Set per cluster reliability requirements.
+```
 
 ### 6.6 New-View (`PBFT_MSG_NEW_VIEW`, type 5)
 
 New primary broadcasts its proof + new Pre-Prepare messages.
 
+**Canonical wire format is in [VIEW-CHANGE.md §4.4](./VIEW-CHANGE.md)** — uses **split MACs** (each embedded Pre-Prepare carries its own Pre-Prepare MAC; New-View outer MAC binds `view ‖ num_vc ‖ v_set_digest`). The summary here is a preview.
+
 ```
-   common header (type=5) | view (4) | num_vc (uint8) |
-   { VC proof, num_vc × ~84 B } | { Pre-Prepare, var } | mac (32)
-   Total: 4 + 4 + 1 + (num_vc × 84) + var + 32 = 41 + num_vc*84 + var bytes
+   common header (type=5) | view (4) | num_vc (1) | reserved (3) |
+   v_set_digest (32) |
+   { VC proof: num_vc × pbft_vc_size_t } |
+   { O-set Pre-Prepares: each carries its own Pre-Prepare MAC } |
+   mac (32)              ← over header + view + num_vc + v_set_digest + VC proofs
+
+   Worst case (n=7, n_prepared=10 each VC): ≈ 2516 B
+   + O-set (10 Pre-Prepares × 338 B): ≈ 3380 B
+   Grand total worst case ≈ 5900 B → UDP only
 ```
 
 | Field | Size | Notes |
 |-------|------|-------|
-| `view` | 4 B | new view number |
+| `view` | 4 B | new view number (v+1) |
 | `num_vc` | 1 B | number of VIEW-CHANGE proofs (≥2f+1 = 5) |
-| VC proofs | var | embedded VIEW-CHANGE messages |
-| O-set | var | Pre-Prepare messages to re-propose |
-| `mac` | 32 B | HMAC |
+| `v_set_digest` | 32 B | SHA-256 over concatenation of all VC MACs |
+| VC proofs | var | embedded VIEW-CHANGE messages (each with own MAC) |
+| O-set | var | Pre-Prepares to re-propose (each with own MAC) |
+| `mac` | 32 B | HMAC over the rest (excluding O-set) |
 
-**Size concern:** with 7 nodes and 5 VC proofs of 84 B each, New-View is **~500 B** — exceeds ESP-NOW limit (250 B)!
-
-**Solution:** Use **Wi-Fi UDP** for New-View, OR split into multiple ESP-NOW fragments (see §8). Default: switch to UDP for view-change, or keep ESP-NOW but cap num_vc to 2 (insufficient — PBFT requires 2f+1).
-
-**Decision:** For n=7, **New-View must use Wi-Fi UDP** — document this as transport-specific limitation.
+**Size concern:** worst-case ~5.9 KB. **Always UDP** — see §8.2.
 
 ### 6.7 Checkpoint (`PBFT_MSG_CHECKPOINT`, type 6)
 
